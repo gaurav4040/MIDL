@@ -1,8 +1,9 @@
 """
-Main training script (fine-tune) — upgraded & disk-safe.
+Hybrid3D Training Script (Ultra Pretty Console Version)
 Usage:
- python -m src.train.train --cfg configs/config.yaml
+    python -m src.train.train --cfg configs/config.yaml
 """
+
 import argparse
 import yaml
 import os
@@ -11,83 +12,102 @@ import numpy as np
 import torch
 import shutil
 import gc
+from tqdm import tqdm
+from colorama import Fore, Back, Style, init
+init(autoreset=True)
+
 from torch.utils.data import DataLoader
 from src.data.dataset import NiftiPatchDataset
 from src.models.hybrid3d import Hybrid3DNet
 from src.models.losses import multi_task_loss
 from src.utils.metrics import dice_metric
 
-# -------------------------
-# Helpers
-# -------------------------
+# -----------------------------
+# Helper Functions
+# -----------------------------
 def get_free_gb(path="."):
     total, used, free = shutil.disk_usage(path)
-    return free / (1024**3)   # convert to GB
+    return free / (1024**3)
+
+def c_green(t): return Fore.GREEN + t + Style.RESET_ALL
+def c_red(t): return Fore.RED + t + Style.RESET_ALL
+def c_yellow(t): return Fore.YELLOW + t + Style.RESET_ALL
+def c_blue(t): return Fore.CYAN + t + Style.RESET_ALL
+def c_magenta(t): return Fore.MAGENTA + t + Style.RESET_ALL
 
 def set_seed(seed=42):
     random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
+# -----------------------------
+# Validation Loop
+# -----------------------------
 def validate(model, loader, device):
     model.eval()
     dices = []
+
     with torch.no_grad():
-        for vol, mask, cls in loader:
+        for vol, mask, cls in tqdm(loader, desc=c_magenta("Validating"), leave=False):
             vol = vol.to(device); mask = mask.to(device)
             seg_logits, _, _ = model(vol)
             dice = dice_metric(torch.sigmoid(seg_logits).cpu(), mask.cpu())
             dices.append(dice)
+
     return float(np.mean(dices)) if len(dices) > 0 else 0.0
 
-# -------------------------
-# Training
-# -------------------------
+# -----------------------------
+# Training Function
+# -----------------------------
 def train(cfg_path):
-    # load config (utf-8 safe)
+
+    # Load config utf-8 safe
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    set_seed(int(cfg.get('training', {}).get('seed', 42)))
+    set_seed(cfg["training"]["seed"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --------------------------
-    # dataset
-    # --------------------------
+    print(c_blue("\n🚀 Starting LUNG-NET Hybrid3D Training...\n"))
+    print(c_green(f"Using device: {device}\n"))
+
+    # -----------------------------
+    # Load dataset
+    # -----------------------------
     ds = NiftiPatchDataset(
-        cfg['data']['volumes_dir'],
-        cfg['data']['masks_dir'],
-        patch_size=tuple(cfg['data']['patch_size']),
+        cfg["data"]["volumes_dir"],
+        cfg["data"]["masks_dir"],
+        patch_size=tuple(cfg["data"]["patch_size"]),
         augment=True
     )
 
     n = len(ds)
     if n == 0:
-        print("❌ No samples found in dataset. Check data paths in config.")
+        print(c_red("❌ Dataset empty. Check volumes/masks directory!"))
         return
 
-    indices = list(range(n))
-    random.shuffle(indices)
+    idx = list(range(n))
+    random.shuffle(idx)
 
-    # 60/20/20 split
+    # Split — 60/20/20
     train_end = int(0.6 * n)
     val_end = int(0.8 * n)
 
-    train_idx = indices[:train_end]
-    val_idx = indices[train_end:val_end]
-    test_idx = indices[val_end:]
+    train_idx = idx[:train_end]
+    val_idx = idx[train_end:val_end]
+    test_idx = idx[val_end:]
 
-    print(f"Total cases: {n}")
-    print(f"Train: {len(train_idx)} ({len(train_idx)/n:.2%})")
-    print(f"Val:   {len(val_idx)} ({len(val_idx)/n:.2%})")
-    print(f"Test:  {len(test_idx)} ({len(test_idx)/n:.2%})")
+    print(c_blue("📊 Dataset Split:"))
+    print(f"  {c_green('Train:')} {len(train_idx)} files ({len(train_idx)/n:.2%})")
+    print(f"  {c_yellow('Val:  ')} {len(val_idx)} files ({len(val_idx)/n:.2%})")
+    print(f"  {c_magenta('Test: ')} {len(test_idx)} files ({len(test_idx)/n:.2%})\n")
 
+    # Loaders
     train_loader = DataLoader(
         torch.utils.data.Subset(ds, train_idx),
-        batch_size=int(cfg['training']['batch_size']),
+        batch_size=cfg["training"]["batch_size"],
         shuffle=True,
-        num_workers=int(cfg['data'].get('num_workers', 4)),
-        pin_memory=bool(cfg['data'].get('pin_memory', True))
+        num_workers=4,
+        pin_memory=True
     )
 
     val_loader = DataLoader(
@@ -95,146 +115,106 @@ def train(cfg_path):
         batch_size=1, shuffle=False, num_workers=2
     )
 
-    test_loader = DataLoader(
-        torch.utils.data.Subset(ds, test_idx),
-        batch_size=1, shuffle=False, num_workers=2
-    )
-
-    # --------------------------
-    # model & optimizer
-    # --------------------------
+    # -----------------------------
+    # Model init
+    # -----------------------------
     model = Hybrid3DNet(
         in_ch=1,
-        base=int(cfg['model']['base_channels']),
-        transformer_cfg=cfg['model'].get('transformer', {}),
-        mc_dropout=bool(cfg['model'].get('mc_dropout', True))
+        base=cfg["model"]["base_channels"],
+        transformer_cfg=cfg["model"]["transformer"],
+        mc_dropout=True
     ).to(device)
 
-    # optional SSL weights loader (safe)
-    ssl_path = cfg.get('training', {}).get('ssl_weights', "ssl_encoder.pth")
-    if ssl_path and os.path.exists(ssl_path):
+    # load SSL weights if available
+    if os.path.exists("ssl_encoder.pth"):
+        print(c_blue("🔑 Loading SSL weights..."))
         try:
-            sd = torch.load(ssl_path, map_location=device)
-            model_state = model.state_dict()
-            loaded = 0
-            for k, v in sd.items():
-                if k in model_state and v.shape == model_state[k].shape:
-                    model_state[k] = v
-                    loaded += 1
-            model.load_state_dict(model_state)
-            print(f"Loaded SSL weights ({loaded} tensors) from {ssl_path}")
-        except Exception as e:
-            print("⚠️ Warning: failed to load SSL weights:", e)
+            sd = torch.load("ssl_encoder.pth", map_location=device)
+            ms = model.state_dict()
+            cnt = 0
+            for k in sd:
+                if k in ms and sd[k].shape == ms[k].shape:
+                    ms[k] = sd[k]; cnt += 1
+            model.load_state_dict(ms)
+            print(c_green(f"✓ Loaded {cnt} SSL weights.\n"))
+        except:
+            print(c_red("⚠ SSL load failed.\n"))
 
-    # safe-cast optimizer params
-    lr = float(cfg['training'].get('lr', 1e-4))
-    weight_decay = float(cfg['training'].get('weight_decay', 1e-5))
+    # Optimizer (safe float cast)
+    lr = float(cfg["training"]["lr"])
+    wd = float(cfg["training"]["weight_decay"])
 
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay
-    )
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
-    # optional scheduler (simple placeholder)
-    scheduler_cfg = cfg['training'].get('scheduler', {}) if 'training' in cfg else {}
-    scheduler = None
-    if scheduler_cfg.get('enabled', False) and scheduler_cfg.get('type') == 'cosine':
-        try:
-            total_epochs = int(cfg['training']['epochs'])
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=max(1, total_epochs - int(scheduler_cfg.get('warmup_epochs', 0))))
-        except Exception:
-            scheduler = None
-
-    # --------------------------
-    # training loop
-    # --------------------------
+    # -----------------------------
+    # TRAIN LOOP
+    # -----------------------------
     best = 0.0
-    MIN_SAVE_GB = float(cfg.get('preprocessing', {}).get('min_save_gb', 2.0)) if cfg.get('preprocessing') else 2.0
-    CRITICAL_GB = float(cfg.get('preprocessing', {}).get('critical_gb', 1.0)) if cfg.get('preprocessing') else 1.0
+    epochs = cfg["training"]["epochs"]
 
-    epochs = int(cfg['training'].get('epochs', 200))
+    MIN_SAVE_GB = 2.0
+    CRITICAL_GB = 1.0
 
-    try:
-        for epoch in range(epochs):
-            # disk check before epoch
+    for epoch in range(epochs):
+
+        free_gb = get_free_gb()
+        if free_gb < CRITICAL_GB:
+            print(c_red(f"\n⛔ TRAINING STOPPED — Low Disk ({free_gb:.2f} GB)\n"))
+            break
+
+        model.train()
+        running_loss = 0.0
+
+        # pretty progress bar
+        loop = tqdm(train_loader, desc=c_green(f"Epoch {epoch+1}/{epochs}"), colour="cyan")
+
+        for vol, mask, cls in loop:
+            vol = vol.to(device); mask = mask.to(device); cls = cls.to(device)
+
+            seg_logits, cls_logits, reg_pred = model(vol)
+            reg_target = torch.zeros_like(reg_pred).to(device)
+
+            loss = multi_task_loss(seg_logits, mask, cls_logits, cls, reg_pred, reg_target, cfg)
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+
+            running_loss += loss.item()
+            loop.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        # validation
+        val_dice = validate(model, val_loader, device)
+        avg_loss = running_loss / max(1, len(train_loader))
+
+        print(f"\n{c_blue('📈 Epoch Summary:')}")
+        print(f"  Train Loss: {c_green(f'{avg_loss:.4f}')}")
+        print(f"  Val Dice:   {c_yellow(f'{val_dice:.4f}')}")
+        print(f"  Free Disk:  {c_magenta(f'{get_free_gb():.2f} GB')}\n")
+
+        # save best model disk-safe
+        if val_dice > best:
             free_gb = get_free_gb()
-            if free_gb < CRITICAL_GB:
-                print(f"\n❌ CRITICAL LOW DISK: {free_gb:.2f} GB left — stopping training safely.")
-                break
+            if free_gb < MIN_SAVE_GB:
+                print(c_red(f"🚨 LOW DISK: {free_gb:.2f} GB — Skip saving model.\n"))
+            else:
+                try:
+                    if os.path.exists("best_model.pth"):
+                        os.remove("best_model.pth")
+                    torch.save(model.state_dict(), "best_model.pth")
+                    best = val_dice
+                    print(c_green(f"💾 Saved checkpoint — best_model.pth (Val Dice={best:.4f})\n"))
+                except Exception as e:
+                    print(c_red(f"❌ Save Failed: {e}"))
 
-            model.train()
-            running_loss = 0.0
+        # cleanup
+        torch.cuda.empty_cache()
+        gc.collect()
 
-            for vol, mask, cls in train_loader:
-                vol = vol.to(device); mask = mask.to(device); cls = cls.to(device)
-
-                seg_logits, cls_logits, reg_pred = model(vol)
-                reg_target = torch.zeros_like(reg_pred).to(device)
-
-                loss = multi_task_loss(seg_logits, mask, cls_logits, cls, reg_pred, reg_target, cfg)
-                optim.zero_grad()
-                loss.backward()
-                optim.step()
-
-                running_loss += loss.item()
-
-            # scheduler step
-            if scheduler is not None:
-                scheduler.step()
-
-            # validation
-            val_dice = validate(model, val_loader, device)
-            avg_train_loss = running_loss / max(1, len(train_loader))
-            print(f"Epoch {epoch+1:03d}/{epochs:03d} | Train Loss: {avg_train_loss:.4f} | Val Dice: {val_dice:.4f} | Free GB: {get_free_gb():.2f}")
-
-            # DISK-SAFE CHECKPOINTING: save only if improved & enough space
-            if val_dice > best:
-                free_gb = get_free_gb()
-                if free_gb < MIN_SAVE_GB:
-                    print(f"🚨 LOW DISK WARNING: Only {free_gb:.2f} GB left! Skipping checkpoint save.")
-                else:
-                    # atomic save pattern: write to temp then rename
-                    tmp_path = "best_model.tmp.pth"
-                    final_path = "best_model.pth"
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                        torch.save(model.state_dict(), tmp_path)
-                        # remove old final if exists (to free space) then rename
-                        if os.path.exists(final_path):
-                            os.remove(final_path)
-                        os.replace(tmp_path, final_path)
-                        best = val_dice
-                        print(f"💾 Saved best_model.pth (Val Dice={best:.4f}) — Free: {free_gb:.2f} GB")
-                    except Exception as e:
-                        print("❌ Error saving checkpoint:", e)
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-
-            # end of epoch cleanup
-            torch.cuda.empty_cache()
-            gc.collect()
-
-    except KeyboardInterrupt:
-        print("\n⛔ Training interrupted by user — exiting gracefully.")
-    except Exception as e:
-        print(f"\n❌ Training crashed with exception: {e}")
-    finally:
-        # final cleanup: ensure no temp checkpoint remains
-        if os.path.exists("best_model.tmp.pth"):
-            try:
-                os.remove("best_model.tmp.pth")
-            except Exception:
-                pass
-
-    print("Training done.")
-    print("Best Val Dice:", best)
-    print("Test set size:", len(test_idx))
-    print("Use test_loader later for final evaluation.")
+    # end
+    print(c_blue("\n🎉 Training Finished!"))
+    print(c_green(f"Best Val Dice: {best:.4f}"))
+    print(c_yellow(f"Test Set Size: {len(test_idx)}\n"))
+    print(c_magenta("👉 Use test_eval.py for final evaluation.\n"))
 
 
 if __name__ == "__main__":
