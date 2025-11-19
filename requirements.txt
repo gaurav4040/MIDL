@@ -1,0 +1,14 @@
+torch>=2.0
+torchvision
+numpy
+scipy
+scikit-image
+SimpleITK
+nibabel
+pyyaml
+tqdm
+pandas
+scikit-learn
+monai>=1.0.0   # optional utilities for medical imaging
+pydicom
+radiomics      # optional - for radiomics features

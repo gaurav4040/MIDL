@@ -1,0 +1,121 @@
+# ==========================================
+#         🌬️ LUNG-NET HYBRID3D CONFIG
+# ==========================================
+
+# ------------------------------------------
+# RAW DATA PREPROCESSING (LIDC)
+# ------------------------------------------
+preprocessing:
+  raw_root: "./patientData/LIDC-IDRI"          # RAW LIDC dataset path
+  output_volumes: "./data/volumes"      # Final cleaned NIfTI CTs
+  output_masks: "./data/masks"          # Final cleaned masks
+  spacing: [1.0, 1.0, 1.0]               # Resampling spacing
+  clip: [-1000, 400]                     # HU window
+  merge_strategy: "consensus"            # union | majority | consensus
+  multiprocessing_workers: 8             # auto: -1 means auto cpu_count-1
+  save_preview_png: false                # optional QC image export
+  cleanup_empty_masks: true              # drop cases with no nodules
+
+
+# ------------------------------------------
+# DATA LOADING (for TRAINING + VAL)
+# ------------------------------------------
+data:
+  volumes_dir: "./data/volumes"
+  masks_dir: "./data/masks"
+  cache_dataset: false                    # cache in RAM? (optional)
+  patch_size: [128, 128, 128]             # 3D patches
+  num_workers: 4
+  pin_memory: true
+  train_split: 0.8                         # 80% train, 20% val
+  augmentations:
+    flips: true
+    rotate: true
+    noise: true
+    elastic: false
+    scale: true
+
+
+# ------------------------------------------
+# MODEL CONFIGURATION
+# ------------------------------------------
+model:
+  name: "Hybrid3DNet"
+  base_channels: 16
+  dropout_rate: 0.1
+
+  transformer:
+    enabled: true
+    patch_size: [4, 4, 4]
+    emb_dim: 64
+    depth: 2
+    nhead: 4
+    ff_dim: 128
+
+  # optional radiomics fusion block
+  radiomics:
+    enabled: false
+    num_features: 32
+
+
+# ------------------------------------------
+# LOSS WEIGHTS
+# ------------------------------------------
+loss:
+  seg_weight: 1.0
+  cls_weight: 0.2
+  reg_weight: 0.1
+  dice_eps: 1e-6
+
+
+# ------------------------------------------
+# TRAINING CONFIG
+# ------------------------------------------
+training:
+  batch_size: 1
+  lr: 0.0001
+  weight_decay:  0.00001
+  optimizer: "adamw"
+  epochs: 200
+  seed: 42
+  amp: true                # mixed precision training
+  grad_clip: 1.0
+  scheduler:
+    enabled: true
+    type: "cosine"
+    warmup_epochs: 5
+
+
+# ------------------------------------------
+# CHECKPOINTING & LOGGING
+# ------------------------------------------
+logging:
+  save_dir: "./checkpoints"
+  save_best_only: true
+  save_every: 10
+  tensorboard: true
+  csv_log: "./logs/training_log.csv"
+  verbose: true
+
+
+# ------------------------------------------
+# INFERENCE PIPELINE
+# ------------------------------------------
+inference:
+  mc_dropout_iters: 8         # for uncertainty estimation
+  patch_overlap: 0.5
+  postprocess:
+    min_nodule_voxels: 20
+    remove_small_components: true
+    apply_lung_mask: false
+  save_outputs: "./outputs"
+
+
+# ------------------------------------------
+# EVALUATION & METRICS
+# ------------------------------------------
+evaluation:
+  compute_auc: true
+  compute_froc: true
+  compute_dice: true
+  save_plots: "./outputs/plots"
